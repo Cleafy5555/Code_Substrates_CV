@@ -1,0 +1,227 @@
+# =========================================================
+# 05_maydec_floret_quality_lmm.R
+# =========================================================
+# Purpose:
+# Reconstruct the mixed-model workflow used to evaluate which floret-level
+# traits and treatment/inoculation effects best explain bunch weight in
+# the May-Dec experiment.
+#
+# What this script does:
+# 1. Reads:
+#      - floret-level measurements (height, diameter, crunch, bunch weight)
+#      - plant-level metadata (treatment, infection status)
+# 2. Joins infection status onto the floret-level records using sample_number.
+# 3. Standardises treatment/inoculation labels and derives harvest order
+#    from the raw date column.
+# 4. Z-scores the continuous predictors so coefficients are directly
+#    comparable in the model.
+# 5. Fits a linear mixed model:
+#      bw ~ treatment * infected + height_z + diameter_z + crunch_z + harvest_z
+#           + (1 | sample_number)
+# 6. Exports:
+#      - fixed-effect table with confidence intervals
+#      - variance decomposition by level
+#      - forest plot of fixed effects
+#
+# Biological note on crunch:
+# - crunch = 1 is best (very crunchy)
+# - crunch = 3 is worst (floppy)
+# Therefore:
+# - a negative coefficient for crunch_z means "better crunch" is
+#   associated with higher bunch weight.
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(forcats)
+  library(lme4)
+  library(lmerTest)
+  library(broom.mixed)
+  library(ggplot2)
+  library(readr)
+})
+
+# -------------------------
+# File paths
+# -------------------------
+floret_file <- file.path("data", "raw", "Floret_measurements_2.xlsx")
+maydec_file <- file.path("data", "raw", "May-Dec 2024 Height data.xlsx")
+
+fig_dir  <- file.path("outputs", "figures")
+stat_dir <- file.path("outputs", "stats")
+
+dir.create(fig_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(stat_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------
+# Read raw inputs
+# -------------------------
+floret_dat <- read_excel(floret_file)
+maydec_dat <- read_excel(maydec_file)
+
+# -------------------------
+# Build plant-level metadata for joining
+# -------------------------
+# The floret file contains repeated floret measurements, while infection
+# status comes from the May-Dec plant-level file. We therefore keep only
+# the metadata needed for the join.
+plant_meta <- maydec_dat %>%
+  select(sample_number, treatment, infected) %>%
+  distinct()
+
+# Flag any duplicate sample IDs in the May-Dec metadata because those
+# would make the join ambiguous.
+dup_check <- plant_meta %>%
+  count(sample_number) %>%
+  filter(n > 1)
+
+if (nrow(dup_check) > 0) {
+  warning("Duplicate sample_number rows found in May–Dec metadata. Inspect before modelling.")
+  print(dup_check)
+}
+
+# Join plant-level infection status onto the floret-level rows.
+dat <- floret_dat %>%
+  left_join(
+    plant_meta %>% select(sample_number, infected),
+    by = "sample_number"
+  )
+
+# -------------------------
+# Clean and standardise variables
+# -------------------------
+dat2 <- dat %>%
+  mutate(
+    sample_number = factor(sample_number),
+
+    # Match treatment levels to the ordering used elsewhere in the chapter.
+    treatment = factor(
+      treatment,
+      levels = c(
+        "control",
+        "biochar",
+        "mushroom",
+        "vermicompost",
+        "u_rockwools",
+        "u_rockwoolb",
+        "n_rockwool"
+      )
+    ),
+
+    infected = case_when(
+      infected %in% c("no", "No", 0, "0") ~ "non_inoculated",
+      infected %in% c("yes", "Yes", 1, "1") ~ "inoculated",
+      TRUE ~ as.character(infected)
+    ),
+    infected = factor(infected, levels = c("non_inoculated", "inoculated")),
+
+    # Convert date to actual Date class and derive a numeric harvest order
+    # for modelling.
+    date = as.Date(date),
+    harvest_order = dplyr::dense_rank(date),
+
+    # Force the measured columns to numeric in case they were imported as
+    # characters from Excel.
+    height   = as.numeric(height),
+    diameter = as.numeric(diameter),
+    crunch   = as.numeric(crunch),
+    bw       = as.numeric(bw),
+
+    # Z-score the continuous predictors so coefficients are on a comparable
+    # scale and match the spirit of the original fixed-effect summary.
+    height_z   = as.numeric(scale(height)),
+    diameter_z = as.numeric(scale(diameter)),
+    crunch_z   = as.numeric(scale(crunch)),
+    harvest_z  = as.numeric(scale(harvest_order))
+  ) %>%
+  filter(
+    !is.na(sample_number),
+    !is.na(treatment),
+    !is.na(infected),
+    !is.na(bw),
+    !is.na(height_z),
+    !is.na(diameter_z),
+    !is.na(crunch_z),
+    !is.na(harvest_z)
+  ) %>%
+  droplevels()
+
+# -------------------------
+# Fit the linear mixed model
+# -------------------------
+# Random effect:
+# - (1 | sample_number) accounts for repeated floret measurements nested
+#   within the same plant/sample.
+#
+# Fixed effects:
+# - treatment and infected, including their interaction
+# - floret height, diameter, crunch, and harvest timing
+m_bw <- lmer(
+  bw ~ treatment * infected +
+    height_z + diameter_z + crunch_z + harvest_z +
+    (1 | sample_number),
+  data = dat2,
+  REML = TRUE
+)
+
+# -------------------------
+# Export fixed effects
+# -------------------------
+fixef_tbl <- broom.mixed::tidy(
+  m_bw,
+  effects = "fixed",
+  conf.int = TRUE,
+  conf.method = "Wald"
+)
+
+write_csv(fixef_tbl, file.path(stat_dir, "05_fig6d_lmer_fixed_effects.csv"))
+
+# -------------------------
+# Variance decomposition by level
+# -------------------------
+# This recreates the simple variance-by-level output used to show how much
+# variance is attributable to the random intercept versus residual noise.
+vc <- as.data.frame(VarCorr(m_bw))
+resid_var  <- attr(VarCorr(m_bw), "sc")^2
+sample_var <- vc$vcov[vc$grp == "sample_number"]
+total_var  <- resid_var + sample_var
+
+r2_by_level <- tibble::tibble(
+  Level = c("Level 1", "sample_number"),
+  R2    = c(resid_var / total_var, sample_var / total_var)
+)
+
+write.table(
+  r2_by_level,
+  file = file.path(stat_dir, "05_lmer_R2_by_effect.txt"),
+  sep = " | ",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# -------------------------
+# Forest plot of fixed effects
+# -------------------------
+plot_tbl <- fixef_tbl %>%
+  filter(term != "(Intercept)") %>%
+  mutate(term = forcats::fct_reorder(term, estimate))
+
+p_forest <- ggplot(plot_tbl, aes(x = estimate, y = term)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_point(size = 2.5) +
+  labs(
+    x = "Effect estimate",
+    y = NULL,
+    title = "Fixed effects from linear mixed model"
+  ) +
+  theme_classic(base_size = 12)
+
+ggsave(
+  file.path(fig_dir, "05_fig6d_lmer_fixed_effects.png"),
+  p_forest,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
