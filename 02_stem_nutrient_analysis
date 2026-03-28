@@ -1,0 +1,226 @@
+# =========================================================
+# 02_stem_nutrient_analysis.R
+# =========================================================
+# Purpose:
+# Analyse stem nutrient concentrations from the substrate screening
+# experiment and summarise treatment effects relative to the control.
+#
+# What this script does:
+# 1. Reads the raw stem nutrient CSV.
+# 2. Standardises treatment labels and parses nutrient values that may
+#    contain symbols such as "<0.5".
+# 3. Summarises each nutrient by treatment (median, IQR, mean, SD).
+# 4. Performs Wilcoxon tests comparing each treatment against the control
+#    for each nutrient, with BH correction.
+# 5. Calculates percent change in the median relative to the control.
+# 6. Exports a summary table and a heatmap of percent changes.
+#
+# Notes:
+# - This script is for stem nutrient chemistry, not the hand-built
+#   literature-comparison table.
+# - The heatmap emphasises direction and magnitude of change relative to
+#   the control rather than raw concentrations.
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(readr)
+  library(readxl)
+  library(janitor)
+  library(rstatix)
+  library(writexl)
+  library(scales)
+  library(stringr)
+  library(forcats)
+})
+
+# -------------------------
+# File paths
+# -------------------------
+infile <- file.path("data", "raw", "broc_nutrient.csv")
+
+fig_dir  <- file.path("outputs", "figures")
+tab_dir  <- file.path("outputs", "tables")
+stat_dir <- file.path("outputs", "stats")
+
+dir.create(fig_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(tab_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(stat_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------
+# Helper to parse values such as "< 0.5"
+# -------------------------
+# readr::parse_number removes any non-numeric characters and keeps the
+# numeric part, which is enough for the exploratory/substrate-comparison
+# purpose here.
+parse_num <- function(x) readr::parse_number(as.character(x))
+
+# -------------------------
+# Treatment labels and colours
+# -------------------------
+substrate_names <- c(
+  "0"  = "Control",
+  "1"  = "Recycled textile",
+  "2"  = "Paper waste",
+  "3"  = "Perlite",
+  "4"  = "Biochar",
+  "5"  = "Enriched Biochar",
+  "6"  = "Coco coir",
+  "7"  = "Sawdust",
+  "8"  = "Peat",
+  "9"  = "Mushroom waste",
+  "10" = "Coffee grounds",
+  "11" = "Sand vermicompost",
+  "12" = "Peat2"
+)
+
+treatment_colors <- c(
+  "#C1DFF0", "#3A3D3E", "#e7298a", "#b2df8a", "#66a61e", "#FBEA4B",
+  "#AF6E4D", "#5E4DB0", "#5EC97A", "#EC9CDE", "#fdbf6f", "#fb9a99"
+)
+
+palette_named <- c(
+  "Control" = "grey50",
+  setNames(treatment_colors, unname(substrate_names)[-1])
+)
+
+# -------------------------
+# Read and clean the nutrient data
+# -------------------------
+raw <- read.csv(infile, stringsAsFactors = FALSE)
+
+# Drop columns that are entirely NA. These often appear in exported lab files.
+clean <- raw[, colSums(is.na(raw)) < nrow(raw)]
+
+clean <- clean %>%
+  rename(
+    sample_id = `Sample.Description..1`,
+    treatment_code = Treatment
+  )
+
+# Replace numeric treatment codes with readable labels.
+clean$treatment <- factor(
+  as.character(clean$treatment_code),
+  levels = names(substrate_names),
+  labels = substrate_names
+)
+
+# Select the nutrient columns used in the chapter.
+nutrient_cols <- c(
+  "Nitrogen", "Phosphorous", "Magnesium", "Potassium", "Calcium", "Sulfur",
+  "Boron", "Iron", "Manganese", "Copper", "Zinc", "Aluminum", "Sodium"
+)
+
+nut <- clean %>%
+  select(sample_id, treatment, all_of(nutrient_cols)) %>%
+  mutate(across(all_of(nutrient_cols), parse_num))
+
+# -------------------------
+# Summaries by treatment
+# -------------------------
+# Medians and IQRs are useful because they are robust to skewed
+# distributions, while means and SDs are retained for readability.
+summary_tbl <- nut %>%
+  pivot_longer(cols = all_of(nutrient_cols), names_to = "nutrient", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  group_by(nutrient, treatment) %>%
+  summarise(
+    n = n(),
+    median = median(value, na.rm = TRUE),
+    iqr = IQR(value, na.rm = TRUE),
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Pull out the control median for each nutrient so percent changes can be
+# calculated relative to the control treatment.
+ctrl_tbl <- summary_tbl %>%
+  filter(treatment == "Control") %>%
+  select(nutrient, ctrl_median = median)
+
+# -------------------------
+# Pairwise Wilcoxon tests vs control
+# -------------------------
+pairwise_vs_control <- function(df) {
+  res <- rstatix::wilcox_test(
+    df,
+    value ~ treatment,
+    ref.group = "Control",
+    p.adjust.method = "BH"
+  ) %>%
+    rstatix::add_significance(p.col = "p.adj")
+
+  if ("p.adj.signif" %in% names(res)) {
+    res <- rename(res, sig = p.adj.signif)
+  } else {
+    res <- mutate(res, sig = NA_character_)
+  }
+
+  res %>%
+    mutate(treatment = group2) %>%
+    select(treatment, p = p.adj, sig)
+}
+
+wilcox_tbl <- nut %>%
+  pivot_longer(cols = all_of(nutrient_cols), names_to = "nutrient", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  mutate(treatment = factor(treatment, levels = c("Control", unname(substrate_names)[-1]))) %>%
+  group_by(nutrient) %>%
+  group_modify(~ pairwise_vs_control(.x)) %>%
+  ungroup()
+
+# -------------------------
+# Final merged results table
+# -------------------------
+final_tbl <- summary_tbl %>%
+  left_join(ctrl_tbl, by = "nutrient") %>%
+  mutate(
+    pct_change_vs_control = 100 * (median - ctrl_median) / ctrl_median
+  ) %>%
+  left_join(wilcox_tbl, by = c("nutrient", "treatment")) %>%
+  mutate(sig = ifelse(is.na(sig), "ns", sig))
+
+write_csv(final_tbl, file.path(tab_dir, "02_stem_nutrient_summary.csv"))
+write_xlsx(
+  list(stem_nutrients = final_tbl),
+  file.path(tab_dir, "02_stem_nutrient_summary.xlsx")
+)
+
+# -------------------------
+# Heatmap of percent change vs control
+# -------------------------
+plot_dat <- final_tbl %>%
+  filter(treatment != "Control") %>%
+  mutate(
+    nutrient = factor(nutrient, levels = nutrient_cols),
+    treatment = factor(treatment, levels = unname(substrate_names)[-1])
+  )
+
+p <- ggplot(plot_dat, aes(x = treatment, y = nutrient, fill = pct_change_vs_control)) +
+  geom_tile(color = "white") +
+  # Only mark cells that reached nominal significance.
+  geom_text(
+    aes(label = ifelse(sig %in% c("*", "**", "***"), sig, "")),
+    size = 5
+  ) +
+  scale_fill_gradient2(
+    low = muted("blue"),
+    mid = "white",
+    high = muted("red"),
+    midpoint = 0,
+    name = "% change\nvs control"
+  ) +
+  labs(x = "Substrate", y = "Nutrient") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+  file.path(fig_dir, "02_stem_nutrient_heatmap.png"),
+  p,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
