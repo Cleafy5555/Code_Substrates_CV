@@ -1,0 +1,269 @@
+# =========================================================
+# 03_floret_yield_timeseries_screen.R
+# =========================================================
+# Purpose:
+# Analyse the floret-yield time series from the broad substrate screening
+# experiment.
+#
+# What this script does:
+# 1. Reads the raw fresh-weight floret spreadsheet.
+# 2. Cleans dates, substrate codes, and missing values.
+# 3. Summarises:
+#      - start of production
+#      - mean floret weight
+#      - total florets produced
+# 4. Builds per-date total yield and per-date floret count summaries.
+# 5. Runs overall Kruskal-Wallis tests and pairwise Wilcoxon tests
+#    against the control.
+# 6. Exports summary/statistical tables.
+# 7. Produces the selected-substrate time-series figure used to show
+#    yield trajectory across harvest dates.
+#
+# Notes:
+# - This script is for the broad substrate screen, not the May-Dec
+#   inoculation/commercial subset.
+# - Total yield here is summarised by substrate and harvest date.
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(lubridate)
+  library(purrr)
+  library(ggplot2)
+  library(rstatix)
+  library(writexl)
+  library(readr)
+  library(janitor)
+  library(openxlsx)
+})
+
+# -------------------------
+# File paths
+# -------------------------
+infile <- file.path("data", "raw", "Fresh_weight_Broccolini_Florets.xlsx")
+
+fig_dir  <- file.path("outputs", "figures")
+tab_dir  <- file.path("outputs", "tables")
+stat_dir <- file.path("outputs", "stats")
+
+dir.create(fig_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(tab_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(stat_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------
+# Treatment labels and colours
+# -------------------------
+substrate_names <- c(
+  "0"  = "Control",
+  "1"  = "Recycled textile",
+  "2"  = "Paper waste",
+  "3"  = "Perlite",
+  "4"  = "Biochar",
+  "5"  = "Enriched Biochar",
+  "6"  = "Coco coir",
+  "7"  = "Sawdust",
+  "8"  = "Peat",
+  "9"  = "Mushroom waste",
+  "10" = "Coffee grounds",
+  "11" = "Sand vermicompost",
+  "12" = "Peat2"
+)
+
+treatment_colors <- c(
+  "#C1DFF0", "#3A3D3E", "#e7298a", "#b2df8a", "#66a61e", "#FBEA4B",
+  "#AF6E4D", "#5E4DB0", "#5EC97A", "#EC9CDE", "#fdbf6f", "#fb9a99"
+)
+
+palette_named <- c(
+  "Control" = "grey50",
+  setNames(treatment_colors, unname(substrate_names)[-1])
+)
+
+# -------------------------
+# Read and clean the raw floret data
+# -------------------------
+data_pol <- read_excel(infile) |>
+  clean_names() |>
+  mutate(
+    date = as.Date(date),
+    substrate = as.character(substrate)
+  ) |>
+  filter(
+    !is.na(substrate),
+    !is.na(date),
+    !is.na(floret_n),
+    !is.na(fweight)
+  ) |>
+  # Substrate 13 was treated as an invalid/placeholder code in the old workflow.
+  filter(substrate != "13") |>
+  mutate(
+    substrate_label = factor(
+      substrate,
+      levels = names(substrate_names),
+      labels = substrate_names
+    )
+  )
+
+# -------------------------
+# High-level floret summary table
+# -------------------------
+summary_pol <- data_pol |>
+  group_by(substrate_label) |>
+  summarise(
+    production_start   = min(date),
+    mean_floret_weight = mean(fweight, na.rm = TRUE),
+    total_florets      = n(),
+    .groups = "drop"
+  )
+
+# -------------------------
+# Derive per-date yield and floret counts
+# -------------------------
+# Yield is summarised by substrate and date as the total weight harvested
+# on that date.
+total_yield_per_plant <- data_pol |>
+  group_by(substrate, substrate_label, date) |>
+  summarise(total_yield = sum(fweight, na.rm = TRUE), .groups = "drop")
+
+# Floret count is the number of florets harvested for a substrate on a
+# given date.
+floret_counts <- data_pol |>
+  group_by(substrate, substrate_label, date) |>
+  summarise(floret_count = n(), .groups = "drop")
+
+# -------------------------
+# Overall non-parametric tests
+# -------------------------
+# These provide a broad substrate-level test before pairwise comparisons.
+kw_yield   <- kruskal.test(total_yield ~ substrate_label, data = total_yield_per_plant)
+kw_florets <- kruskal.test(floret_count ~ substrate_label, data = floret_counts)
+
+# -------------------------
+# Helper: pairwise Wilcoxon tests vs control
+# -------------------------
+# This wrapper:
+# - compares each non-control treatment against the control
+# - guards against too-small sample sizes
+# - applies BH correction to the resulting p-values
+wilcox_vs_control <- function(df, response, group_col = "substrate_label",
+                              control_label = "Control", min_n = 2) {
+  resp_sym  <- rlang::sym(response)
+  group_sym <- rlang::sym(group_col)
+
+  df <- df %>%
+    filter(!is.na(!!resp_sym), !is.na(!!group_sym)) %>%
+    mutate(!!group_sym := droplevels(factor(!!group_sym)))
+
+  ctrl <- df %>% filter(!!group_sym == control_label) %>% pull(!!resp_sym)
+  n_ctrl <- length(ctrl)
+
+  trts <- df %>%
+    filter(!!group_sym != control_label) %>%
+    pull(!!group_sym) %>%
+    as.character() %>%
+    unique()
+
+  out <- purrr::map_dfr(trts, function(treat) {
+    y <- df %>% filter(!!group_sym == treat) %>% pull(!!resp_sym)
+    n_treat <- length(y)
+
+    if (n_ctrl < min_n || n_treat < min_n) {
+      tibble(
+        treatment   = treat,
+        n_control   = n_ctrl,
+        n_treat     = n_treat,
+        W_statistic = NA_real_,
+        p_value     = NA_real_,
+        note        = "Skipped: insufficient n"
+      )
+    } else {
+      wt <- stats::wilcox.test(ctrl, y, exact = FALSE)
+      tibble(
+        treatment   = treat,
+        n_control   = n_ctrl,
+        n_treat     = n_treat,
+        W_statistic = unname(wt$statistic),
+        p_value     = wt$p.value,
+        note        = NA_character_
+      )
+    }
+  })
+
+  out %>%
+    mutate(
+      p_adj_BH = ifelse(is.na(p_value), NA_real_, p.adjust(p_value, method = "BH"))
+    )
+}
+
+pw_yield   <- wilcox_vs_control(total_yield_per_plant, "total_yield")
+pw_florets <- wilcox_vs_control(floret_counts, "floret_count")
+
+# -------------------------
+# Export tables
+# -------------------------
+write_xlsx(
+  list(
+    Summary_florets = summary_pol,
+    Total_yield_per_plant = total_yield_per_plant,
+    Floret_counts_per_plant = floret_counts,
+    Wilcoxon_yield_vs_control = pw_yield,
+    Wilcoxon_florets_vs_control = pw_florets
+  ),
+  file.path(tab_dir, "03_floret_yield_statistics.xlsx")
+)
+
+overall_tbl <- tibble(
+  Outcome   = c("Total yield per plant", "Floret count per plant-date"),
+  Test      = "Kruskal–Wallis",
+  Statistic = c(unname(kw_yield$statistic),  unname(kw_florets$statistic)),
+  df        = c(unname(kw_yield$parameter),  unname(kw_florets$parameter)),
+  p_value   = c(kw_yield$p.value,            kw_florets$p.value)
+)
+
+write_csv(overall_tbl, file.path(stat_dir, "03_yield_kw_tests.csv"))
+write_csv(pw_yield,   file.path(stat_dir, "03_total_yield_vs_control_wilcox.csv"))
+write_csv(pw_florets, file.path(stat_dir, "03_floret_count_vs_control_wilcox.csv"))
+
+# -------------------------
+# Time-series plot for selected substrates
+# -------------------------
+# The chapter emphasises a smaller subset of treatments in the yield
+# trajectory plot rather than showing all substrates at once.
+selected_substrates <- c("Control", "Biochar", "Mushroom waste", "Sand vermicompost")
+
+plot_data <- total_yield_per_plant |>
+  filter(substrate_label %in% selected_substrates)
+
+p_yield_pub <- ggplot(plot_data, aes(x = date, y = total_yield, color = substrate_label)) +
+  geom_point(alpha = 0.75, size = 2.2) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.5, linewidth = 1.5) +
+  scale_color_manual(
+    values = palette_named[selected_substrates],
+    name = "Substrate"
+  ) +
+  labs(
+    title = "Yield over time for selected substrates",
+    x = "Harvest date",
+    y = "Total yield per plant (g)"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.4),
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.title = element_text(color = "black", face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+
+ggsave(
+  file.path(fig_dir, "03_yield_over_time_selected_substrates.png"),
+  p_yield_pub,
+  width = 10,
+  height = 6,
+  dpi = 600
+)
