@@ -2,7 +2,7 @@
 # 05_maydec_floret_quality_lmm.R
 # =========================================================
 # Purpose:
-# Reconstruct the mixed-model workflow used to evaluate which floret-level
+# Builds the mixed-model workflow used to evaluate which floret-level
 # traits and treatment/inoculation effects best explain bunch weight in
 # the May-Dec experiment.
 #
@@ -26,8 +26,8 @@
 # Biological note on crunch:
 # - crunch = 1 is best (very crunchy)
 # - crunch = 3 is worst (floppy)
-# Therefore:
-# - a negative coefficient for crunch_z means "better crunch" is
+# However:
+# - crunch was reversed so a positive coefficient for crunch_z would mean "better crunch" is
 #   associated with higher bunch weight.
 # =========================================================
 
@@ -128,12 +128,15 @@ dat2 <- dat %>%
     crunch   = as.numeric(crunch),
     bw       = as.numeric(bw),
 
-    # Z-score the continuous predictors so coefficients are on a comparable
-    # scale and match the spirit of the original fixed-effect summary.
-    height_z   = as.numeric(scale(height)),
-    diameter_z = as.numeric(scale(diameter)),
-    crunch_z   = as.numeric(scale(crunch)),
-    harvest_z  = as.numeric(scale(harvest_order))
+    ## Reverse crunch only for this model so that larger values mean better crunch.
+    # Original scoring: 1 = very crunchy (best), 3 = floppy (worst).
+    # Reversed scoring: 3 = very crunchy (best), 1 = floppy (worst).
+    crunch_rev = 4 - crunch,
+    bw       = as.numeric(bw),
+    height_z     = as.numeric(scale(height)),
+    diameter_z   = as.numeric(scale(diameter)),
+    crunch_rev_z = as.numeric(scale(crunch_rev)),
+    harvest_z    = as.numeric(scale(harvest_order))
   ) %>%
   filter(
     !is.na(sample_number),
@@ -142,7 +145,7 @@ dat2 <- dat %>%
     !is.na(bw),
     !is.na(height_z),
     !is.na(diameter_z),
-    !is.na(crunch_z),
+    !is.na(crunch_rev_z),
     !is.na(harvest_z)
   ) %>%
   droplevels()
@@ -159,7 +162,7 @@ dat2 <- dat %>%
 # - floret height, diameter, crunch, and harvest timing
 m_bw <- lmer(
   bw ~ treatment * infected +
-    height_z + diameter_z + crunch_z + harvest_z +
+    height_z + diameter_z + crunch_rev_z + harvest_z +
     (1 | sample_number),
   data = dat2,
   REML = TRUE
