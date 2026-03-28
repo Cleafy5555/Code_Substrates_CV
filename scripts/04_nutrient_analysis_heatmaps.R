@@ -1,5 +1,5 @@
 ## ================================================================
-## FINAL – Publication-ready nutrient analysis + heatmaps
+## Nutrient analysis + heatmaps
 ## ================================================================
 
 ## ---- Libraries ----
