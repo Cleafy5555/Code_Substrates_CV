@@ -1,0 +1,251 @@
+# =========================================================
+# 01_polytunnel_biomass_screen.R
+# =========================================================
+# Purpose:
+# Analyse the initial substrate screening experiment using dry biomass
+# measured in roots, shoots, and leaves from broccolini plants grown in
+# the polytunnel trial.
+#
+# What this script does:
+# 1. Reads the raw dry-weight spreadsheet for the whole-plant harvest.
+# 2. Standardises substrate codes and plant-part labels.
+# 3. Fits a fixed-effects linear model:
+#      dry weight ~ substrate * plant part
+# 4. Uses estimated marginal means to compare each substrate against the
+#    control within each plant part.
+# 5. Exports:
+#      - ANOVA table
+#      - treatment-vs-control contrast table
+#      - combined figure of boxplots for root, shoot, and leaf biomass
+#
+# Notes:
+# - This corresponds to the broad biomass screening stage of the chapter.
+# - Control is always used as the reference substrate.
+# - BH-adjusted p-values are used for the treatment-vs-control contrasts.
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(stringr)
+  library(ggplot2)
+  library(emmeans)
+  library(patchwork)
+  library(readr)
+  library(broom)      # used for tidy ANOVA output
+})
+
+# -------------------------
+# File paths
+# -------------------------
+infile  <- file.path("data", "raw", "Dry_weight_POLYTUNNEL_BROCS.xlsx")
+sheet   <- "Whole plant"
+
+fig_dir  <- file.path("outputs", "figures")
+tab_dir  <- file.path("outputs", "tables")
+stat_dir <- file.path("outputs", "stats")
+
+dir.create(fig_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(tab_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(stat_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------
+# Labels and colours
+# -------------------------
+# Numeric substrate codes are converted to human-readable labels so the
+# output is easier to interpret and publication-ready.
+substrate_names <- c(
+  "0"  = "Control",
+  "1"  = "Recycled textile",
+  "2"  = "Paper waste",
+  "3"  = "Perlite",
+  "4"  = "Biochar",
+  "5"  = "Enriched Biochar",
+  "6"  = "Coco coir",
+  "7"  = "Sawdust",
+  "8"  = "Peat",
+  "9"  = "Mushroom waste",
+  "10" = "Coffee grounds",
+  "11" = "Sand vermicompost",
+  "12" = "Peat2"
+)
+
+control_color <- "#7B7D7E"
+treatment_colors <- c(
+  "#C1DFF0", "#3A3D3E", "#e7298a", "#b2df8a", "#66a61e", "#FBEA4B",
+  "#AF6E4D", "#5E4DB0", "#5EC97A", "#EC9CDE", "#fdbf6f", "#fb9a99"
+)
+
+# Match the palette to the printed substrate labels rather than the raw codes.
+palette_named <- c(
+  setNames(control_color, "Control"),
+  setNames(treatment_colors, substrate_names[names(substrate_names) != "0"])
+)
+
+# -------------------------
+# Read and clean the raw data
+# -------------------------
+raw <- read_excel(infile, sheet = sheet)
+
+dryw <- raw %>%
+  transmute(
+    # Some old exports encode substrates as S0, S1, ... rather than 0, 1, ...
+    Substrate   = as.character(Substrate),
+    plant_part  = toupper(as.character(plant_part)),
+    dweight     = as.numeric(dweight)
+  ) %>%
+  filter(is.finite(dweight)) %>%
+  mutate(
+    # Remove a leading "S" if present so the codes match the substrate map.
+    Substrate = ifelse(grepl("^S\\d+$", Substrate), sub("^S", "", Substrate), Substrate),
+
+    # Convert short plant-part codes to readable labels.
+    plant_part = recode(
+      plant_part,
+      "R" = "Root",
+      "S" = "Shoot",
+      "L" = "Leaf",
+      .default = plant_part
+    ),
+
+    # Add human-readable treatment labels.
+    SubstrateLabel = substrate_names[Substrate],
+
+    # Set factor order so control is always first in plots/tables.
+    Substrate      = factor(Substrate, levels = names(substrate_names)),
+    SubstrateLabel = factor(SubstrateLabel, levels = unname(substrate_names)),
+    plant_part     = factor(plant_part, levels = c("Root", "Shoot", "Leaf"))
+  )
+
+# -------------------------
+# Global fixed-effects model
+# -------------------------
+# This model asks:
+# - Does substrate affect biomass?
+# - Does plant part affect biomass?
+# - Does the effect of substrate differ among root/shoot/leaf?
+model <- lm(dweight ~ Substrate * plant_part, data = dryw)
+
+# Export ANOVA in tidy format for supplementary/statistical reporting.
+anova_tbl <- broom::tidy(anova(model))
+write_csv(anova_tbl, file.path(stat_dir, "01_global_anova_biomass.csv"))
+
+# -------------------------
+# Estimated marginal means and contrasts vs control
+# -------------------------
+# Estimated marginal means are used here to compare each substrate to the
+# control within each plant part.
+emm <- emmeans::emmeans(model, specs = ~ Substrate | plant_part)
+
+# Find the factor level corresponding to the control substrate code "0".
+ctrl_level <- which(levels(dryw$Substrate) == "0")
+
+contr <- emmeans::contrast(
+  emm,
+  method = "trt.vs.ctrl",
+  ref = ctrl_level
+)
+
+contr_df <- summary(contr, infer = c(TRUE, TRUE), adjust = "none") |>
+  as.data.frame() |>
+  mutate(
+    # Apply Benjamini-Hochberg correction across the set of contrasts.
+    p_adj = p.adjust(p.value, method = "BH"),
+    sig   = case_when(
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01  ~ "**",
+      p_adj < 0.05  ~ "*",
+      TRUE          ~ "ns"
+    ),
+
+    # Convert contrast text like "4 - 0" into the substrate code only.
+    Substrate = sub(" - 0$", "", contrast),
+    SubstrateLabel = substrate_names[Substrate]
+  ) |>
+  select(plant_part, Substrate, SubstrateLabel, estimate, SE, df, t.ratio, p.value, p_adj, sig)
+
+write_csv(contr_df, file.path(stat_dir, "01_biomass_vs_control_bh.csv"))
+
+# -------------------------
+# Helper function to place significance labels on boxplots
+# -------------------------
+make_ann <- function(part_name, df_part, contrast_df) {
+  sig_df <- contrast_df %>%
+    filter(plant_part == part_name, !is.na(p_adj), p_adj < 0.05) %>%
+    select(SubstrateLabel, p_adj)
+
+  if (!nrow(sig_df)) return(data.frame())
+
+  # For each significant substrate, place the label slightly above the
+  # maximum observed value in that panel.
+  ymax <- df_part %>%
+    group_by(SubstrateLabel) %>%
+    summarise(ymax = max(dweight, na.rm = TRUE), .groups = "drop")
+
+  rng  <- range(df_part$dweight, na.rm = TRUE)
+  bump <- 0.02 * (rng[2] - rng[1])
+
+  sig_df %>%
+    left_join(ymax, by = "SubstrateLabel") %>%
+    mutate(
+      label = case_when(
+        p_adj < 0.001 ~ "***",
+        p_adj < 0.01  ~ "**",
+        TRUE          ~ "*"
+      ),
+      y = ymax + bump
+    ) %>%
+    select(SubstrateLabel, y, label)
+}
+
+# -------------------------
+# Plotting helper
+# -------------------------
+plot_part <- function(df_part, title_txt, ann_df) {
+  p <- ggplot(df_part, aes(x = SubstrateLabel, y = dweight, fill = SubstrateLabel)) +
+    geom_boxplot(width = 0.7, outlier.shape = 21, outlier.alpha = 0.8, size = 0.4) +
+    geom_text(
+      data = ann_df,
+      aes(x = SubstrateLabel, y = y, label = label),
+      inherit.aes = FALSE,
+      color = "red",
+      size = 7
+    ) +
+    scale_fill_manual(values = palette_named) +
+    labs(title = title_txt, x = "Substrate", y = "Dry weight (g)") +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x  = element_text(angle = 30, hjust = 1, vjust = 1),
+      plot.title   = element_text(hjust = 0, face = "bold"),
+      legend.position = "right"
+    )
+
+  # Ensure there is enough headroom for labels.
+  if (nrow(ann_df)) {
+    p <- p + expand_limits(y = max(ann_df$y, na.rm = TRUE) * 1.02)
+  }
+
+  p
+}
+
+# Build annotations and panels separately for each organ.
+ann_root  <- make_ann("Root",  filter(dryw, plant_part == "Root"),  contr_df)
+ann_shoot <- make_ann("Shoot", filter(dryw, plant_part == "Shoot"), contr_df)
+ann_leaf  <- make_ann("Leaf",  filter(dryw, plant_part == "Leaf"),  contr_df)
+
+p_root  <- plot_part(filter(dryw, plant_part == "Root"),  "Root",  ann_root)
+p_shoot <- plot_part(filter(dryw, plant_part == "Shoot"), "Shoot", ann_shoot)
+p_leaf  <- plot_part(filter(dryw, plant_part == "Leaf"),  "Leaf",  ann_leaf)
+
+# Stack vertically and collect a single legend.
+combined <- (p_root / p_shoot / p_leaf) +
+  plot_layout(ncol = 1, guides = "collect") &
+  theme(legend.position = "right")
+
+ggsave(
+  file.path(fig_dir, "01_biomass_screen_boxplots.png"),
+  combined,
+  width = 10,
+  height = 14,
+  dpi = 300
+)
