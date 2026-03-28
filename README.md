@@ -1,6 +1,6 @@
 # Substrates analysis
 
-This repository contains cleaned and annotated R scripts for the paper "RECYCLED AND WASTE-DERIVED SUBSTRATES ENHANCE YIELD AND VEGETATIVE GROWTH BUT NOT CLUBROOT DISEASE OUTCOMES IN BROCCOLINI"
+This repository contains cleaned and annotated R scripts for the paper "RECYCLED AND WASTE-DERIVED SUBSTRATES ENHANCE YIELD AND VEGETATIVE GROWTH BUT NOT CLUBROOT DISEASE OUTCOMES IN BROCCOLINI" and Chapter 2 of my thesis.
 
 
 
