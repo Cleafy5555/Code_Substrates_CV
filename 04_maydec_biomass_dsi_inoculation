@@ -1,0 +1,259 @@
+# =========================================================
+# 04_maydec_biomass_dsi_inoculation.R
+# =========================================================
+# Purpose:
+# Analyse the May-Dec 2024 inoculation experiment, focusing on dry biomass
+# (root and shoot) and disease severity index (DSI) across substrate
+# treatments and inoculation status.
+#
+# What this script does:
+# 1. Reads the May-Dec 2024 experiment spreadsheet.
+# 2. Calculates total dry weight from shoot + root.
+# 3. Standardises treatment and inoculation labels.
+# 4. Fits:
+#      - a linear model for dry weight with treatment × tissue × infection
+#      - a linear model for DSI with treatment × infection
+# 5. Uses estimated marginal means to compare each treatment against the
+#    control within each infection/tissue grouping.
+# 6. Builds a combined bar figure for root, shoot, and DSI with patterned
+#    bars for inoculated plants.
+#
+# Notes:
+# - This script corresponds to the clubroot subset experiment rather than
+#   the broad initial screening.
+# - DSI is treated here as numeric to align with the original workflow.
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(emmeans)
+  library(ggpattern)
+  library(forcats)
+  library(readr)
+})
+
+# -------------------------
+# File paths
+# -------------------------
+infile <- file.path("data", "raw", "May-Dec 2024 Height data.xlsx")
+
+fig_dir  <- file.path("outputs", "figures")
+stat_dir <- file.path("outputs", "stats")
+
+dir.create(fig_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(stat_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------
+# Read and standardise the May-Dec dataset
+# -------------------------
+broc_may <- read_excel(infile) %>%
+  mutate(
+    # Total dry weight was used in some exploratory analyses and is kept
+    # here for completeness, even though the figure focuses on root/shoot/DSI.
+    dweight_total = dweightshoot + dweightroot,
+
+    treatment = factor(treatment),
+
+    infected = case_when(
+      infected %in% c(0, "0") ~ "no",
+      infected %in% c(1, "1") ~ "yes",
+      TRUE                    ~ as.character(infected)
+    ),
+    infected = factor(infected, levels = c("no", "yes"))
+  )
+
+# -------------------------
+# Colours and legend labels
+# -------------------------
+pal <- c(
+  "control"      = "grey50",
+  "biochar"      = "#b2df8a",
+  "mushroom"     = "#88665D",
+  "vermicompost" = "#F7E34C",
+  "u_rockwools"  = "#EEC1AD",
+  "u_rockwoolb"  = "#228224",
+  "n_rockwool"   = "#39B6E0"
+)
+
+leg_labels <- c(
+  "control"      = "control",
+  "biochar"      = "biochar",
+  "mushroom"     = "mushroom waste",
+  "vermicompost" = "vermicompost",
+  "u_rockwools"  = "used rockwool (tomato)",
+  "u_rockwoolb"  = "used rockwool (cucumber)",
+  "n_rockwool"   = "new rockwool"
+)
+
+broc_may <- broc_may %>%
+  mutate(treatment = factor(treatment, levels = names(pal)))
+
+# -------------------------
+# Root + shoot dry weight model
+# -------------------------
+# Reshape to long format so a single model can compare root and shoot dry
+# weight while including tissue as a factor.
+long_dw <- broc_may %>%
+  select(sample_number, treatment, infected, dweightshoot, dweightroot) %>%
+  pivot_longer(
+    c(dweightshoot, dweightroot),
+    names_to = "tissue",
+    values_to = "dry_weight"
+  ) %>%
+  mutate(
+    tissue = recode(tissue, dweightshoot = "shoot", dweightroot = "root"),
+
+    # Force control to be the baseline treatment.
+    treatment = stats::relevel(treatment, ref = "control")
+  ) %>%
+  filter(!is.na(dry_weight))
+
+# Model includes treatment, tissue, infection, and all interactions.
+m_dw <- lm(dry_weight ~ treatment * tissue * infected, data = long_dw)
+
+# Estimated marginal means are used so the figure can show fitted means
+# and confidence intervals for each treatment/tissue/infection group.
+emm_dw <- emmeans(m_dw, ~ treatment * tissue * infected)
+
+# Contrast each treatment against the control within each tissue × infection group.
+ctr_dw <- emmeans(m_dw, ~ treatment | tissue * infected) %>%
+  contrast(method = "trt.vs.ctrl", ref = "control") %>%
+  as.data.frame() %>%
+  mutate(
+    treatment = sub(" - control", "", contrast),
+    sig = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE            ~ "ns"
+    )
+  )
+
+emm_df_dw <- as.data.frame(emm_dw) %>%
+  left_join(
+    ctr_dw %>% select(treatment, tissue, infected, sig),
+    by = c("treatment", "tissue", "infected")
+  )
+
+# -------------------------
+# Disease severity model
+# -------------------------
+# DSI is analysed separately because it is not split into tissues.
+m_dsi <- lm(dscore ~ treatment * infected, data = broc_may)
+emm_dsi <- emmeans(m_dsi, ~ treatment * infected)
+
+ctr_dsi <- emmeans(m_dsi, ~ treatment | infected) %>%
+  contrast(method = "trt.vs.ctrl", ref = "control") %>%
+  as.data.frame() %>%
+  mutate(
+    treatment = sub(" - control", "", contrast),
+    sig = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE            ~ "ns"
+    )
+  )
+
+emm_df_dsi <- as.data.frame(emm_dsi) %>%
+  left_join(
+    ctr_dsi %>% select(treatment, infected, sig),
+    by = c("treatment", "infected")
+  ) %>%
+  mutate(tissue = "DSI")
+
+# -------------------------
+# Combine root, shoot, and DSI output for plotting/export
+# -------------------------
+emm_all <- bind_rows(emm_df_dw, emm_df_dsi) %>%
+  mutate(
+    treatment = factor(treatment, levels = names(pal)),
+    tissue    = factor(tissue, levels = c("root", "shoot", "DSI")),
+    infected  = factor(infected, levels = c("no", "yes"))
+  ) %>%
+  group_by(tissue) %>%
+  # pad gives the vertical offset for significance labels within each panel
+  mutate(pad = 0.08 * diff(range(emmean, na.rm = TRUE))) %>%
+  ungroup() %>%
+  # prevent negative lower confidence intervals from plotting below zero
+  mutate(lower.CL_plot = pmax(lower.CL, 0))
+
+write_csv(emm_all, file.path(stat_dir, "04_maydec_emmeans_root_shoot_dsi.csv"))
+
+# -------------------------
+# Plot combined biomass + DSI figure
+# -------------------------
+pd <- position_dodge(width = 0.8)
+
+p_dw_dsi <- ggplot(
+  emm_all,
+  aes(
+    x = treatment,
+    y = emmean,
+    fill = treatment,
+    pattern = infected,
+    group = interaction(treatment, infected)
+  )
+) +
+  # Extend the root and shoot panels to a shared upper range so the layout
+  # stays visually comparable.
+  geom_blank(
+    data = subset(emm_all, tissue %in% c("root", "shoot")),
+    aes(y = 60)
+  ) +
+  ggpattern::geom_col_pattern(
+    position = pd,
+    width = 0.8,
+    colour = "black",
+    linewidth = 0.3,
+    pattern_colour = "black",
+    pattern_fill = "black",
+    pattern_size = 0.2,
+    pattern_spacing = 0.015,
+    pattern_density = 0.45
+  ) +
+  geom_errorbar(
+    aes(ymin = lower.CL_plot, ymax = upper.CL),
+    position = pd,
+    width = 0.18,
+    linewidth = 0.3
+  ) +
+  geom_text(
+    aes(y = emmean + pad, label = sig),
+    position = pd,
+    size = 4.5,
+    fontface = "bold"
+  ) +
+  facet_wrap(~ tissue, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = pal, labels = leg_labels, name = "Substrate") +
+  ggpattern::scale_pattern_manual(
+    values = c("no" = "none", "yes" = "stripe"),
+    name = "Inoculated"
+  ) +
+  labs(
+    x = "Substrate type",
+    y = "Dry weight (g) / DSI"
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_classic(base_size = 13) +
+  theme(
+    panel.spacing.x = unit(16, "pt"),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.text = element_text(size = 10.5),
+    legend.title = element_text(size = 12),
+    plot.margin = margin(8, 20, 8, 8)
+  )
+
+ggsave(
+  file.path(fig_dir, "04_maydec_biomass_dsi_by_substrate.png"),
+  p_dw_dsi,
+  width = 11,
+  height = 4.5,
+  dpi = 300
+)
